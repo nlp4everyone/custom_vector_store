@@ -1,9 +1,9 @@
 from qdrant_client import QdrantClient, models
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue
+from qdrant_client.models import Distance, VectorParams, PointStruct
 from qdrant_client.conversions import common_types as types
 from llama_index.core.schema import BaseNode,TextNode
 from llama_index.core.base.embeddings.base import BaseEmbedding
-from typing import Optional, Union, List, Tuple, Sequence
+from typing import Optional, Union, List, Tuple, Sequence, Literal
 from uuid import uuid4
 from llama_index.core.schema import NodeWithScore, TextNode
 
@@ -40,22 +40,74 @@ class QdrantVectorStore():
                             collection_name :str,
                             embedding_dimension :int,
                             shard_number :int = 2,
-                            distance :Distance = Distance.COSINE):
+                            distance :Distance = Distance.COSINE,
+                            quantization_mode :Literal['binary','scalar','product','none'] = "scalar",
+                            default_segment_number :int = 4,
+                            on_disk :bool = True,
+                            alway_ram :bool = True):
         """Create collection with default name
         Parameters:
         - collection_name (str): The name of desired collection
         - embedding_dimension (int): The number of dimension for vector embedding
         - shard_number (int): The number of parallel processes as the same time. Default is 2,
-        - distance (Distance): The metrics for vector search ( Cosine, Dot Product, Euclid, etc).
+        - distance (Distance): The metrics for vector search ( Cosine, Dot Product, Euclid, etc.).
+        - quantization_mode (Literal): If enabled, it brings more compact representation embedding,then cache
+        more in RAM and reduce the number of disk reads. With scalar, compression with be up to 4x times
+        (float32 -> uint8) with the most balance in accuracy and speed. Binary is extreme case of scalar, reducing the
+        memory footprint by 32 (with limited model), and the most rapid mode. Product is the slower method, and loss of
+        accuracy, only recommended for high dimensional vectors.
+        - default_segment_number (int). Default is 4. Larger value will enhance the latency, smaller one the throughput.
+        - on_disk (bool): Default is True, make sure that original vectors will be stored on disk
+        - always_ram (bool): Default is True, indicated that quantized vectors is persisted on RAM
         """
         assert collection_name, "Collection name must be a string"
         assert embedding_dimension, "Dimension must be an integer"
 
-        # Create collection if it doesnt exist
+        # Whe collection is existed or not
         if not self._client.collection_exists(collection_name):
+            # Default is None
+            quantization_config = None
+            # Define quantization mode if enable
+            if quantization_mode == "scalar":
+                # Scalar mode, currently Qdrant only support INT8
+                quantization_config = models.ScalarQuantization(
+                    scalar = models.ScalarQuantizationConfig(
+                        type = models.ScalarType.INT8,
+                        quantile = 0.99, # if specify 0.99, 1% of extreme values will be excluded from the quantization bounds.
+                        always_ram = alway_ram
+                    )
+                )
+            elif quantization_mode == "binary":
+                # Binary mode
+                quantization_config = models.BinaryQuantization(
+                    binary = models.BinaryQuantizationConfig(
+                        always_ram = alway_ram,
+                    ),
+                ),
+            elif quantization_mode == "product":
+                # Product quantization mode
+                quantization_config = models.ProductQuantization(
+                    product = models.ProductQuantizationConfig(
+                        compression = models.CompressionRatio.X16, # Default X16
+                        always_ram = alway_ram,
+                    ),
+                ),
+
+            # High precision
+            vectors_config = VectorParams(size = embedding_dimension,
+                                          distance = distance,
+                                          on_disk = on_disk, # Original vector persisted on disk
+                                          hnsw_config = models.HnswConfigDiff(on_disk = on_disk)) # Turn on or off
+            # Optimizer config
+            optimizers_config = models.OptimizersConfigDiff(default_segment_number = default_segment_number)
+            
+            # Create collection
             self._client.create_collection(
                 collection_name = collection_name,
-                vectors_config = VectorParams(size = embedding_dimension, distance = distance),
+                vectors_config = vectors_config,
+                shard_number = shard_number,
+                quantization_config = quantization_config,
+                optimizers_config = optimizers_config
             )
 
     def __get_embeddings(self,
@@ -156,7 +208,8 @@ class QdrantVectorStore():
         # Get embedding dimension
         embedding_dimension = len(embeddings[0])
         # Create collection if doesn't exist!
-        self.__create_collection(collection_name = self._collection_name, embedding_dimension = embedding_dimension)
+        self.__create_collection(collection_name = self._collection_name,
+                                 embedding_dimension = embedding_dimension)
 
         # Insert vector to collection
         self.__insert_points(list_embeddings = embeddings, list_payloads = payloads)
@@ -170,7 +223,7 @@ class QdrantVectorStore():
                                     show_progress :bool = True):
         """Re-embedding the existed collection to another collection"""
         # Get points from current collection
-        points,_ = self.get_points()
+        points,_ = self._get_points()
 
         # Check length of points
         if len(points) == 0:
@@ -214,21 +267,40 @@ class QdrantVectorStore():
     def __search(self,
                  query_vector: List[Num],
                  filter : Optional[models.Filter] = None,
-                 similarity_top_k :int = 3) -> List[types.ScoredPoint]:
+                 similarity_top_k :int = 3,
+                 rescore :bool = True) -> List[types.ScoredPoint]:
+        """Search and return top-k result from input embedding vector
+        Parameter:
+        - query_vector (List[Num]): List of value represent for sematic embedding of query.
+        filter (Filter): Filter the result under conditions.
+        similarity_top_k (int): Determine the number of result should be returned.
+        rescore (bool): Disable rescoring, which will reduce the number of disk reads, but slightly decrease the
+        precision"""
         if not self._client.collection_exists(self._collection_name):
             raise Exception(f"Collection {self._collection_name} isn't existed!")
+
+        # Search params
+        # search_params = models.SearchParams(hnsw_ef=512, exact=False)
+        search_params = None
+        # Disable rescore method
+        if not rescore:
+            search_params = models.SearchParams(
+                quantization=models.QuantizationSearchParams(rescore = False)
+            )
+
         # Return search
         return self._client.search(
             collection_name = self._collection_name,
             query_vector = query_vector,
             limit = similarity_top_k,
-            search_params = models.SearchParams(hnsw_ef=512, exact=False),
+            search_params = search_params,
             query_filter = filter,
         )
 
     def retrieve(self,
                  query :str,
-                 similarity_top_k :int = 3) -> Sequence[NodeWithScore]:
+                 similarity_top_k :int = 3) :
+        # -> Sequence[NodeWithScore]
         """Retrieve nodes from vector store corresponding to question"""
         # Get query embedding
         query_embedding = self._embedding_model.get_query_embedding(query = query)
@@ -237,6 +309,7 @@ class QdrantVectorStore():
                                       similarity_top_k = similarity_top_k)
         # Convert node to NodeWithScore
         return self.__convert_score_point_to_node_with_score(scored_points = scored_points)
+        # return self._client.query(collection_name = self._collection_name,query_text = query)
 
     def update_point(self, id, vector):
         result = self._client.update_vectors(
@@ -248,24 +321,24 @@ class QdrantVectorStore():
                 )])
         print(result)
 
-    def retrieve_points(self, ids :list[Union[str,int]]):
+    def _retrieve_points(self, ids :list[Union[str,int]]):
         return self._client.retrieve(collection_name = self._collection_name,
                                      ids = ids,
                                      with_vectors = True)
-    def collection_info(self) -> types.CollectionInfo:
+    def _collection_info(self) -> types.CollectionInfo:
         return self._client.get_collection(self._collection_name)
 
-    def count_points(self) -> int:
+    def _count_points(self) -> int:
         # Get total amount of points
         result = self._client.count(self._collection_name)
         return result.count
 
-    def get_points(self,
+    def _get_points(self,
                    limit :Optional[int] = "all",
                    with_vector :bool = False) -> Tuple[List[types.Record], Optional[types.PointId]]:
         """Get all the point in the Qdrant collection or with limited amount"""
         # Get total point
-        total_points = self.count_points()
+        total_points = self._count_points()
 
         # Limit if specify
         if limit == "all": limit = total_points
@@ -274,7 +347,7 @@ class QdrantVectorStore():
                                    limit = limit,
                                    with_vectors = with_vector)
 
-    def set_payload(self, point :list[Union[str,int]]):
+    def __set_payload(self, point :list[Union[str,int]]):
         self._client.set_payload(collection_name = self._collection_name,
                                  payload = {},
                                  points = point)
