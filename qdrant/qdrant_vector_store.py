@@ -1,28 +1,26 @@
 from qdrant_client import QdrantClient, models
-from qdrant_client.models import Distance, VectorParams, PointStruct
+from qdrant_client.models import Distance, VectorParams
 from qdrant_client.conversions import common_types as types
-from llama_index.core.schema import BaseNode,TextNode
+from llama_index.core.schema import BaseNode, NodeWithScore, TextNode
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from typing import Optional, Union, List, Tuple, Sequence, Literal
 from uuid import uuid4
-from llama_index.core.schema import NodeWithScore, TextNode
 
-# Type
+# DataType
 Num = Union[int, float]
+Embedding = List[float]
+
 # Params
 _DEFAULT_UPLOAD_BATCH_SIZE = 64
 
 class QdrantVectorStore():
     def __init__(self,
                  collection_name :str,
-                 embedding_model: BaseEmbedding,
                  url :str = "http://localhost:6333",
                  port :int = 6333,
                  grpc_port :int = 6334,
                  prefer_grpc :bool = False,
-                 api_key :Optional[str] = None,
-                 embedded_batch_size: int = 64,
-                 embedded_num_workers: Optional[int] = None) -> None:
+                 api_key :Optional[str] = None) -> None:
         """Init Qdrant client service"""
         assert collection_name, "Collection name must be string"
         self._client = QdrantClient(url = url,
@@ -32,9 +30,6 @@ class QdrantVectorStore():
                                     prefer_grpc = prefer_grpc)
         # Get value
         self._collection_name = collection_name
-        self._embedding_model = embedding_model
-        self._embedded_batch_size = embedded_batch_size
-        self._embedded_num_workers = embedded_num_workers
 
     def __create_collection(self,
                             collection_name :str,
@@ -44,7 +39,7 @@ class QdrantVectorStore():
                             quantization_mode :Literal['binary','scalar','product','none'] = "scalar",
                             default_segment_number :int = 4,
                             on_disk :bool = True,
-                            alway_ram :bool = True):
+                            alway_ram :bool = True) -> None:
         """Create collection with default name
         Parameters:
         - collection_name (str): The name of desired collection
@@ -99,7 +94,10 @@ class QdrantVectorStore():
                                           on_disk = on_disk, # Original vector persisted on disk
                                           hnsw_config = models.HnswConfigDiff(on_disk = on_disk)) # Turn on or off
             # Optimizer config
-            optimizers_config = models.OptimizersConfigDiff(default_segment_number = default_segment_number)
+            # When indexing threshold is 0, It will enable to avoid unnecessary indexing of vectors,
+            # which will be overwritten by the next batch.
+            optimizers_config = models.OptimizersConfigDiff(default_segment_number = default_segment_number,
+                                                            indexing_threshold = 0)
             
             # Create collection
             self._client.create_collection(
@@ -109,13 +107,18 @@ class QdrantVectorStore():
                 quantization_config = quantization_config,
                 optimizers_config = optimizers_config
             )
+            # Update collection
+            self._client.update_collection(
+                collection_name = collection_name,
+                optimizer_config = models.OptimizersConfigDiff(indexing_threshold = 20000),
+            )
 
     def __get_embeddings(self,
                          texts :list[str],
                          embedding_model : BaseEmbedding,
                          batch_size :int,
                          num_workers :int,
-                         show_progress :bool = True):
+                         show_progress :bool = True) -> List[Embedding]:
         """Return embedding from documents"""
         # Set batch size and num workers
         embedding_model.num_workers = num_workers
@@ -158,8 +161,7 @@ class QdrantVectorStore():
             for i in range(len(payloads)): payloads[i].update({"embedding_model_name": embedding_model_name})
         return payloads
 
-    def __convert_score_point_to_node_with_score(self,
-                                                 scored_points :List[types.ScoredPoint]) -> Sequence[NodeWithScore]:
+    def __convert_score_point_to_node_with_score(self,scored_points :List[types.ScoredPoint]) -> Sequence[NodeWithScore]:
         # Get text nodes (LlamaIndex type)
         text_nodes = [TextNode.from_dict(point.payload["_node_content"]) for point in scored_points]
         # return NodeWithScore
@@ -177,33 +179,32 @@ class QdrantVectorStore():
         if not len(list_embeddings) == len(list_payloads):
             raise Exception("Number of embeddings must be equal with number of payloads")
 
-        # Get default points ids
-        if point_ids == None:
-            point_ids = [str(uuid4()) for i in range(len(list_embeddings))]
-
+        # Collection name
+        collection_name = collection_name if collection_name != None else self._collection_name
         # Upload point
-        self._client.upload_points(
-            collection_name = collection_name if collection_name != None else self._collection_name,
-            points = [
-                PointStruct(id = point_ids[i],
-                            vector = list_embeddings[i],
-                            payload = list_payloads[i] ) for i in range(len(point_ids))
-            ],
-            batch_size = batch_size,
-            parallel = parallel
-        )
+        self._client.upload_collection(collection_name = collection_name,
+                                       ids = point_ids,
+                                       vectors = list_embeddings,
+                                       payload = list_payloads,
+                                       batch_size = batch_size,
+                                       parallel = parallel)
 
-    def insert_documents(self, documents :Sequence[BaseNode]) -> None:
+    def insert_documents(self,
+                         documents :Sequence[BaseNode],
+                         embedding_model: BaseEmbedding,
+                         embedded_batch_size: int = 64,
+                         embedded_num_workers: Optional[int] = None
+                         ) -> None:
         # Get embedding model name
-        embedding_model_name = self._embedding_model.model_name if isinstance(self._embedding_model.model_name,str) else ""
+        embedding_model_name = embedding_model.model_name if isinstance(embedding_model.model_name,str) else ""
         # Define payloads
         payloads = self.__convert_documents_to_payloads(documents = documents, embedding_model_name = embedding_model_name)
         # Get content and its embedding
         contents = [doc.get_content() for doc in documents]
         embeddings = self.__get_embeddings(texts = contents,
-                                           embedding_model = self._embedding_model,
-                                           batch_size = self._embedded_batch_size,
-                                           num_workers = self._embedded_num_workers)
+                                           embedding_model = embedding_model,
+                                           batch_size = embedded_batch_size,
+                                           num_workers = embedded_num_workers)
 
         # Get embedding dimension
         embedding_dimension = len(embeddings[0])
@@ -220,7 +221,7 @@ class QdrantVectorStore():
                                     upload_batch_size :int = _DEFAULT_UPLOAD_BATCH_SIZE,
                                     embedded_batch_size :int = 64,
                                     embedded_num_workers :int = 4,
-                                    show_progress :bool = True):
+                                    show_progress :bool = True) -> None:
         """Re-embedding the existed collection to another collection"""
         # Get points from current collection
         points,_ = self._get_points()
@@ -299,11 +300,12 @@ class QdrantVectorStore():
 
     def retrieve(self,
                  query :str,
-                 similarity_top_k :int = 3) :
+                 embedding_model: BaseEmbedding,
+                 similarity_top_k :int = 3) -> Sequence[NodeWithScore]:
         # -> Sequence[NodeWithScore]
         """Retrieve nodes from vector store corresponding to question"""
         # Get query embedding
-        query_embedding = self._embedding_model.get_query_embedding(query = query)
+        query_embedding = embedding_model.get_query_embedding(query = query)
         # Get nodes
         scored_points = self.__search(query_vector = query_embedding,
                                       similarity_top_k = similarity_top_k)
