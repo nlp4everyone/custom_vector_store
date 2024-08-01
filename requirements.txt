@@ -1,0 +1,5 @@
+fastembed==0.3.4
+llama_index==0.10.58
+numpy==2.0.1
+qdrant_client==1.10.1
+transformers==4.43.3
