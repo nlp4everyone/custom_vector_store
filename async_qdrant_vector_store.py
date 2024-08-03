@@ -35,8 +35,48 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                  default_segment_number: int = 4,
                  on_disk: bool = True) -> None:
 
-        """Init Qdrant client service"""
-        """- on_disk (bool): Default is True, make sure that original vectors will be stored on disk"""
+        """
+        Init Qdrant client service
+
+        :param collection_name: The name of collection (Required).
+        :type collection_name: str
+        :param url: The Qdrant url string.
+        :type url: str
+        :param port: Qdrant port. Default is 6333.
+        :type port: int
+        :param grpc_port: Grpc port. Default is 6334.
+        :type grpc_port: int
+        :param prefer_grpc: Whether prefer grpc or not
+        :type prefer_grpc: bool
+        :param api_key: api key for connecting
+        :type api_key: str
+        :param hybrid_search: Enable hybrid search. Default is False.
+        :type hybrid_search: bool
+        :param dense_embedding_model: The dense embedding model. Default is BAAI/bge-base-en-v1.5
+        :type dense_embedding_model: str
+        :param spare_embedding_model: The dense embedding model. Default is prithvida/Splade_PP_en_v1.
+        :type spare_embedding_model: str
+        :param distance: The calculated distance for similarity search. Default is Cosine.
+        :type distance: Distance
+        :param embedding_folder_cached: Directory path for saving model.
+        :type embedding_folder_cached: str
+        :param shard_number: The number of parallel processes as the same time. Default is 2.
+        :type shard_number: int
+        :param quantization_mode: Include scalar, binary and product.
+        :type quantization_mode: Literal
+        :param default_segment_number: Default is 4. Larger value will enhance the latency, smaller one the throughput.
+        :type default_segment_number: int
+        """
+
+        # Set value
+        self._collection_name = collection_name
+        self._hybrid_search = hybrid_search
+        self._on_disk = on_disk
+        self._distance = distance
+        self._dense_embedding_model = dense_embedding_model
+        self._shard_number = shard_number
+        self._quantization_mode = quantization_mode
+        self._default_segment_number = default_segment_number
 
         # Inherit
         super().__init__(collection_name = collection_name,
@@ -61,44 +101,10 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                          grpc_port = grpc_port,
                                          api_key = api_key,
                                          prefer_grpc = prefer_grpc)
-
-        # Get value
-        self._collection_name = collection_name
-        # Set value
-        self._hybrid_search = hybrid_search
-        self._on_disk = on_disk
-        self._distance = distance
-        self._dense_embedding_model = dense_embedding_model
-        self._shard_number = shard_number
-        self._quantization_mode = quantization_mode
-        self._default_segment_number = default_segment_number
-
-        # If FastEmbed dense model enabled
-        if isinstance(self._dense_embedding_model, str):
-            # Get list supported models
-            dense_supported_models = TextEmbedding.list_supported_models()
-            dense_supported_models = [model['model'] for model in dense_supported_models]
-
-            # Check Dense EmbedModel is available
-            if self._dense_embedding_model not in dense_supported_models:
-                raise Exception(f"{self._dense_embedding_model} is not supported!")
-            # Set model
-            self._client.set_model(embedding_model_name=self._dense_embedding_model,
-                                   cache_dir=embedding_folder_cached)
-        # Enable hybrid search
-        if self._hybrid_search:
-            # Get list supported models
-            sparse_supported_models = SparseTextEmbedding.list_supported_models()
-            sparse_supported_models = [model['model'] for model in sparse_supported_models]
-
-            if isinstance(spare_embedding_model, str):
-                # Check Dense EmbedModel is available
-                if spare_embedding_model not in sparse_supported_models:
-                    raise Exception(f"{spare_embedding_model} is not supported!")
-
-            # Set model
-            self._client.set_sparse_model(embedding_model_name=spare_embedding_model,
-                                          cache_dir=embedding_folder_cached)
+        # Set embed model
+        self._set_embed_model()
+        # Set hybrid mode
+        self._set_hybrid_mode()
 
     async def __create_collection(self,
                                   collection_name :str,
@@ -108,17 +114,23 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                   quantization_mode :Literal['binary','scalar','product','none'] = "scalar",
                                   default_segment_number :int = 4,
                                   always_ram :bool = True) -> None:
-        """Create collection with default name
-        Parameters:
-        - collection_name (str): The name of desired collection
-        - shard_number (int): The number of parallel processes as the same time. Default is 2,
-        - quantization_mode (Literal): If enabled, it brings more compact representation embedding,then cache
+        """
+        Create collection with default name
+
+        :param collection_name: The name of desired collection
+        :type collection_name: str
+        :param shard_number: The number of parallel processes as the same time. Default is 2.
+        :type shard_number: int
+        :param quantization_mode: If enabled, it brings more compact representation embedding,then cache
         more in RAM and reduce the number of disk reads. With scalar, compression with be up to 4x times
         (float32 -> uint8) with the most balance in accuracy and speed. Binary is extreme case of scalar, reducing the
         memory footprint by 32 (with limited model), and the most rapid mode. Product is the slower method, and loss of
         accuracy, only recommended for high dimensional vectors.
-        - default_segment_number (int). Default is 4. Larger value will enhance the latency, smaller one the throughput.
-        - always_ram (bool): Default is True, indicated that quantized vectors is persisted on RAM
+        :type quantization_mode: Literal
+        :param default_segment_number: Default is 4. Larger value will enhance the latency, smaller one the throughput.
+        :type: int
+        :param always_ram: Default is True, indicated that quantized vectors is persisted on RAM.
+        :type always_ram: bool
         """
         assert collection_name, "Collection name must be a string"
 
@@ -179,7 +191,20 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                batch_size :int,
                                num_workers :int,
                                show_progress :bool = True) -> List[Embedding]:
-        """Return embedding from documents"""
+        """
+        Return embedding from documents
+
+        Args:
+            texts (list[str]): List of input text
+            embedding_model (BaseEmbedding): The text embedding model
+            batch_size (int): The desired batch size
+            num_workers (int): The desired num workers
+            show_progress (bool): Indicate show progress or not
+
+        Returns:
+             Return list of Embedding
+        """
+
         # Set batch size and num workers
         embedding_model.num_workers = num_workers
         embedding_model.embed_batch_size = batch_size
@@ -197,7 +222,18 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                               collection_name :Optional[str] = None,
                               batch_size :int = _DEFAULT_UPLOAD_BATCH_SIZE,
                               parallel :int = 1) -> None:
-        """Insert point to the collection"""
+        """
+        Insert point to the collection
+
+        Args:
+            list_embeddings (Required): List of embeddings
+            list_payloads (List[dict]) (Required): List of payloads
+            point_ids (list[str]) (Optional): List of point id
+            collection_name (str) (Optional): Name of collection for importing
+            batch_size (int): The desired batch size
+            parallel (int): The desired batch size
+        """
+
         # Check size
         if not len(list_embeddings) == len(list_payloads):
             raise Exception("Number of embeddings must be equal with number of payloads")
@@ -220,6 +256,21 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                embedded_num_workers: Optional[int] = None,
                                upload_batch_size: int = 16,
                                upload_parallel :Optional[int] = None) -> None:
+        """
+        Insert document to collection.
+
+        :param documents: List of BaseNode.
+        :type documents: Sequence[BaseNode]
+        :param embedded_batch_size: Batch size for embedding model. Default is 64.
+        :type embedded_batch_size: int
+        :param embedded_num_workers: Batch size for embedding model (Optional). Default is None.
+        :type embedded_num_workers: int
+        :param upload_batch_size: Batch size for uploading points. Default is 16.
+        :type upload_batch_size: int
+        :param upload_parallel: Number of parallel for uploading point (Optional). Default is None.
+        :type upload_parallel: Optional[int]
+        """
+
         # Get content and its embedding
         contents = [doc.get_content() for doc in documents]
         embeddings = None
@@ -252,9 +303,11 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         # Hybrid Search enabled
         if self._hybrid_search:
             sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
+
         # Define payloads
         payloads = self._convert_documents_to_payloads(documents = documents,
                                                        embedding_model_name = model_name)
+
         # Create collection if doesn't exist!
         await self.__create_collection(collection_name = self._collection_name,
                                        dense_vectors_config = dense_vectors_config,
@@ -340,13 +393,19 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                        filter : Optional[models.Filter] = None,
                        similarity_top_k :int = 3,
                        rescore :bool = True) -> List[types.ScoredPoint]:
-        """Search and return top-k result from input embedding vector
-        Parameter:
-        - query_vector (List[Num]): List of value represent for sematic embedding of query.
-        filter (Filter): Filter the result under conditions.
-        similarity_top_k (int): Determine the number of result should be returned.
-        rescore (bool): Disable rescoring, which will reduce the number of disk reads, but slightly decrease the
-        precision"""
+        """
+        Search and return top-k result from input embedding vector
+
+        Args:
+            query_vector (List[Num]): List of value represent for sematic embedding of query.
+            filter (Filter): Filter the result under conditions.
+            similarity_top_k (int): Determine the number of result should be returned.
+            rescore (bool): Disable rescoring, which will reduce the number of disk reads, but slightly decrease the precision
+        Returns:
+            List[types.ScoredPoint]
+        """
+
+        # Check collection
         if not await self._client.collection_exists(self._collection_name):
             raise Exception(f"Collection {self._collection_name} isn't existed!")
 
@@ -370,10 +429,17 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
     async def retrieve(self,
                        query :str,
                        similarity_top_k :int = 3) -> Sequence[NodeWithScore]:
-        """Retrieve nodes from vector store corresponding to question.
-        :param
-        - query (str): The query str for retrieve.
-        - similarity_top_k (int). Default is 3. Return top-k element from retrieval"""
+        """
+        Retrieve nodes from vector store corresponding to question.
+
+        :parameter query: The query str for retrieve.
+        :type query: str
+        :parameter similarity_top_k: Default is 3. Return top-k element from retrieval.
+        :type similarity_top_k: int
+        :return: Return a sequence of NodeWithScore
+        :rtype Sequence[NodeWithScore]
+        """
+
         # Check collection
         if not self._client.collection_exists(collection_name = self._collection_name):
             raise Exception(f"Collection {self._collection_name} not existed")
@@ -397,9 +463,11 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             return self._convert_query_response_to_node_with_score(scored_points = scored_points)
 
     async def _collection_info(self) -> types.CollectionInfo:
+        """Return collection info"""
         return await self._client.get_collection(self._collection_name)
 
     async def _count_points(self) -> int:
+        """Return the total amount of point inside collection"""
         # Get total amount of points
         result = await self._client.count(self._collection_name)
         return result.count
@@ -407,7 +475,13 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
     async def _get_points(self,
                           limit :Optional[int] = "all",
                           with_vector :bool = False) -> Tuple[List[types.Record], Optional[types.PointId]]:
-        """Get all the point in the Qdrant collection or with limited amount"""
+        """
+        Get all the point in the Qdrant collection or with limited amount
+
+        Args:
+            limit (int, optional): The number of point retrieved. Default is all.
+            with_vector (bool): Whether return vector or not.
+        """
         # Get total point
         total_points = await self._count_points()
 
