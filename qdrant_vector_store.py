@@ -1,9 +1,11 @@
 from qdrant_client import QdrantClient, models
-from qdrant_client.models import Distance, VectorParams, PointStruct, ScoredPoint, QueryResponse
+from qdrant_client.models import Distance, VectorParams, ScoredPoint, QueryResponse
 from qdrant_client.conversions import common_types as types
 from llama_index.core.schema import BaseNode, NodeWithScore, TextNode
 from llama_index.core.base.embeddings.base import BaseEmbedding
 from typing import Optional, Union, List, Tuple, Sequence, Literal
+from fastembed import (TextEmbedding,
+                       SparseTextEmbedding)
 from uuid import uuid4
 
 # DataType
@@ -21,10 +23,14 @@ class QdrantVectorStore():
                  grpc_port :int = 6334,
                  prefer_grpc :bool = False,
                  api_key :Optional[str] = None,
-                 dense_embedding_model: Union[BaseEmbedding, str] = "sentence-transformers/all-MiniLM-L6-v2",
-                 spare_embedding_model: Optional[str] = None,
-                 embedding_folder_cached: str = "cached",
+                 hybrid_search :bool = False,
+                 dense_embedding_model: Union[BaseEmbedding, str] = "BAAI/bge-base-en-v1.5",
+                 spare_embedding_model: Optional[str] = "prithvida/Splade_PP_en_v1",
                  distance: Distance = Distance.COSINE,
+                 embedding_folder_cached: str = "cached",
+                 shard_number: int = 2,
+                 quantization_mode: Literal['binary', 'scalar', 'product', 'none'] = "scalar",
+                 default_segment_number: int = 4,
                  on_disk: bool = True) -> None:
 
         """Init Qdrant client service"""
@@ -38,18 +44,45 @@ class QdrantVectorStore():
         # Get value
         self._collection_name = collection_name
         # Set value
+        self._hybrid_search = hybrid_search
         self._on_disk = on_disk
         self._distance = distance
         self._dense_embedding_model = dense_embedding_model
+        self._shard_number = shard_number
+        self._quantization_mode = quantization_mode
+        self._default_segment_number = default_segment_number
 
         # If FastEmbed dense model enabled
         if isinstance(self._dense_embedding_model,str):
+            # Get list supported models
+            dense_supported_models = TextEmbedding.list_supported_models()
+            dense_supported_models = [model['model'] for model in dense_supported_models]
+
+            # Check Dense EmbedModel is available
+            if self._dense_embedding_model not in dense_supported_models:
+                raise Exception(f"{self._dense_embedding_model} is not supported!")
+            # Set model
             self._client.set_model(embedding_model_name = self._dense_embedding_model,
                                    cache_dir = embedding_folder_cached)
+        # Enable hybrid search
+        if self._hybrid_search:
+            # Get list supported models
+            sparse_supported_models = SparseTextEmbedding.list_supported_models()
+            sparse_supported_models = [model['model'] for model in sparse_supported_models]
+
+            if isinstance(spare_embedding_model,str):
+                # Check Dense EmbedModel is available
+                if spare_embedding_model not in sparse_supported_models:
+                    raise Exception(f"{spare_embedding_model} is not supported!")
+
+            # Set model
+            self._client.set_sparse_model(embedding_model_name = spare_embedding_model,
+                                          cache_dir = embedding_folder_cached)
 
     def __create_collection(self,
                             collection_name :str,
-                            vectors_config: Union[VectorParams,dict],
+                            dense_vectors_config: Union[VectorParams,dict],
+                            sparse_vectors_config :Optional[str] = None,
                             shard_number :int = 2,
                             quantization_mode :Literal['binary','scalar','product','none'] = "scalar",
                             default_segment_number :int = 4,
@@ -106,7 +139,8 @@ class QdrantVectorStore():
             # Create collection
             self._client.create_collection(
                 collection_name = collection_name,
-                vectors_config = vectors_config,
+                vectors_config = dense_vectors_config,
+                sparse_vectors_config = sparse_vectors_config,
                 shard_number = shard_number,
                 quantization_config = quantization_config,
                 optimizers_config = optimizers_config
@@ -134,7 +168,7 @@ class QdrantVectorStore():
         # Return embedding
         return embedding_model.get_text_embedding_batch(texts = texts, show_progress = show_progress)
 
-    def __convert_documents_to_payloads(self,
+    def _convert_documents_to_payloads(self,
                                    documents :Sequence[BaseNode],
                                    embedding_model_name :Optional[str] = None,
                                    include_embedding_name :bool = True) -> list[dict]:
@@ -166,12 +200,12 @@ class QdrantVectorStore():
             for i in range(len(payloads)): payloads[i].update({"embedding_model_name": embedding_model_name})
         return payloads
 
-    def __convert_score_point_to_node_with_score(self,scored_points :List[ScoredPoint]) -> Sequence[NodeWithScore]:
+    def _convert_score_point_to_node_with_score(self,scored_points :List[ScoredPoint]) -> Sequence[NodeWithScore]:
         text_nodes = [TextNode.from_dict(point.payload["_node_content"]) for point in scored_points]
         # return NodeWithScore
         return [NodeWithScore(node = text_nodes[i], score = point.score) for (i,point) in enumerate(scored_points)]
 
-    def __convert_query_response_to_node_with_score(self,scored_points :List[QueryResponse]) -> Sequence[NodeWithScore]:
+    def _convert_query_response_to_node_with_score(self,scored_points :List[QueryResponse]) -> Sequence[NodeWithScore]:
         text_nodes = [TextNode.from_dict(point.metadata["_node_content"]) for point in scored_points]
         # return NodeWithScore
         return [NodeWithScore(node = text_nodes[i], score = point.score) for (i,point) in enumerate(scored_points)]
@@ -203,7 +237,9 @@ class QdrantVectorStore():
     def insert_documents(self,
                          documents :Sequence[BaseNode],
                          embedded_batch_size: int = 64,
-                         embedded_num_workers: Optional[int] = None) -> None:
+                         embedded_num_workers: Optional[int] = None,
+                         upload_batch_size: int = 16,
+                         upload_parallel :Optional[int] = None) -> None:
         # Get content and its embedding
         contents = [doc.get_content() for doc in documents]
         embeddings = None
@@ -222,31 +258,47 @@ class QdrantVectorStore():
             # Get embedding dimension
             embedding_dimension = len(embeddings[0])
             # Define vector config
-            vectors_config = VectorParams(size = embedding_dimension,
-                                          distance = self._distance,
-                                          on_disk = self._on_disk,
-                                          hnsw_config = models.HnswConfigDiff(on_disk = self._on_disk))
+            dense_vectors_config = VectorParams(size = embedding_dimension,
+                                                distance = self._distance,
+                                                on_disk = self._on_disk,
+                                                hnsw_config = models.HnswConfigDiff(on_disk = self._on_disk))
         else:
             # When embedding model is str, default is activated with FastEmbed model
-            vectors_config = self._client.get_fastembed_vector_params()
+            dense_vectors_config = self._client.get_fastembed_vector_params()
             # Get params
-            model_name = list(vectors_config)[0]
+            model_name = list(dense_vectors_config)[0]
+
+        sparse_embedding_model = None
+        # Hybrid Search enbable
+        if self._hybrid_search:
+            sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
+
 
         # Define payloads
-        payloads = self.__convert_documents_to_payloads(documents = documents,
-                                                        embedding_model_name = model_name)
+        payloads = self._convert_documents_to_payloads(documents = documents,
+                                                       embedding_model_name = model_name)
         # Create collection if doesn't exist!
         self.__create_collection(collection_name = self._collection_name,
-                                 vectors_config = vectors_config)
+                                 dense_vectors_config = dense_vectors_config,
+                                 sparse_vectors_config = sparse_embedding_model,
+                                 shard_number = self._shard_number,
+                                 quantization_mode = self._quantization_mode,
+                                 default_segment_number = self._default_segment_number)
+
         # Insert vector to collection
         if isinstance(self._dense_embedding_model, BaseEmbedding):
             # With BaseEmbedding model
-            self.__insert_points(list_embeddings = embeddings, list_payloads = payloads)
+            self.__insert_points(list_embeddings = embeddings,
+                                 list_payloads = payloads,
+                                 batch_size = upload_batch_size,
+                                 parallel = upload_parallel)
         else:
             # With FastEmbed Model
             self._client.add(collection_name = self._collection_name,
                              documents = contents,
-                             metadata = payloads)
+                             metadata = payloads,
+                             batch_size = upload_batch_size,
+                             parallel = upload_parallel)
 
     def reembedding_with_collection(self,
                                     embedding_model : BaseEmbedding,
@@ -289,8 +341,14 @@ class QdrantVectorStore():
 
         # Get embedding dimension
         embedding_dimension = len(embeddings[0])
+        # Define vector config
+        dense_vectors_config = VectorParams(size=embedding_dimension,
+                                            distance=self._distance,
+                                            on_disk=self._on_disk,
+                                            hnsw_config=models.HnswConfigDiff(on_disk=self._on_disk))
         # Create collection if doesn't exist!
-        self.__create_collection(collection_name = collection_name, embedding_dimension = embedding_dimension)
+        self.__create_collection(collection_name = collection_name,
+                                 dense_vectors_config = dense_vectors_config)
 
         # Insert
         self.__insert_points(collection_name = collection_name,
@@ -338,6 +396,9 @@ class QdrantVectorStore():
         :param
         - query (str): The query str for retrieve.
         - similarity_top_k (int). Default is 3. Return top-k element from retrieval"""
+        # Check collection
+        if not self._client.collection_exists(collection_name = self._collection_name):
+            raise Exception(f"Collection {self._collection_name} not existed")
 
         # With LlamaIndex Embedding case
         if isinstance(self._dense_embedding_model, BaseEmbedding):
@@ -347,7 +408,7 @@ class QdrantVectorStore():
             scored_points = self.__search(query_vector = query_embedding,
                                           similarity_top_k = similarity_top_k)
             # Convert to node with score
-            return self.__convert_score_point_to_node_with_score(scored_points=scored_points)
+            return self._convert_score_point_to_node_with_score(scored_points=scored_points)
         else:
             # With FastEmbed model
             # Get nodes
@@ -355,7 +416,7 @@ class QdrantVectorStore():
                                                collection_name = self._collection_name,
                                                limit = similarity_top_k)
             # Convert to node with score
-            return self.__convert_query_response_to_node_with_score(scored_points = scored_points)
+            return self._convert_query_response_to_node_with_score(scored_points = scored_points)
 
     def update_point(self, id, vector):
         result = self._client.update_vectors(
