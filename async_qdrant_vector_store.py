@@ -1,5 +1,5 @@
 from qdrant_client import AsyncQdrantClient, models
-from qdrant_client.models import Distance, VectorParams
+from qdrant_client.models import Distance, VectorParams, Filter
 from qdrant_client.conversions import common_types as types
 from llama_index.core.schema import BaseNode, NodeWithScore
 from llama_index.core.base.embeddings.base import BaseEmbedding
@@ -25,11 +25,13 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                  grpc_port :int = 6334,
                  prefer_grpc :bool = False,
                  api_key :Optional[str] = None,
-                 hybrid_search :bool = False,
+                 enable_hybrid :bool = False,
+                 enable_semantic_cache :bool = False,
                  dense_embedding_model: Union[BaseEmbedding, str] = "BAAI/bge-base-en-v1.5",
                  spare_embedding_model: Optional[str] = "prithvida/Splade_PP_en_v1",
                  distance: Distance = Distance.COSINE,
                  embedding_folder_cached: str = "cached",
+                 semantic_cache_threshold :float = 0.4,
                  shard_number: int = 2,
                  quantization_mode: Literal['binary', 'scalar', 'product', 'none'] = "scalar",
                  default_segment_number: int = 4,
@@ -50,8 +52,10 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         :type prefer_grpc: bool
         :param api_key: api key for connecting
         :type api_key: str
-        :param hybrid_search: Enable hybrid search. Default is False.
-        :type hybrid_search: bool
+        :param enable_hybrid: Enable hybrid search. Default is False.
+        :type enable_hybrid: bool
+        :param enable_semantic_cache: Enable semantic cache optimization. Default is False.
+        :type enable_semantic_cache: bool
         :param dense_embedding_model: The dense embedding model. Default is BAAI/bge-base-en-v1.5
         :type dense_embedding_model: str
         :param spare_embedding_model: The dense embedding model. Default is prithvida/Splade_PP_en_v1.
@@ -60,6 +64,8 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         :type distance: Distance
         :param embedding_folder_cached: Directory path for saving model.
         :type embedding_folder_cached: str
+        :param semantic_cache_threshold: Threshold for semantic cache. Default is 0.45
+        :type semantic_cache_threshold: float
         :param shard_number: The number of parallel processes as the same time. Default is 2.
         :type shard_number: int
         :param quantization_mode: Include scalar, binary and product.
@@ -67,44 +73,122 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         :param default_segment_number: Default is 4. Larger value will enhance the latency, smaller one the throughput.
         :type default_segment_number: int
         """
-
-        # Set value
-        self._collection_name = collection_name
-        self._hybrid_search = hybrid_search
-        self._on_disk = on_disk
-        self._distance = distance
-        self._dense_embedding_model = dense_embedding_model
-        self._shard_number = shard_number
-        self._quantization_mode = quantization_mode
-        self._default_segment_number = default_segment_number
-
-        # Inherit
         super().__init__(collection_name = collection_name,
                          url = url,
                          port = port,
                          grpc_port = grpc_port,
                          prefer_grpc = prefer_grpc,
                          api_key = api_key,
-                         hybrid_search = hybrid_search,
+                         enable_hybrid = enable_hybrid,
+                         enable_semantic_cache = enable_semantic_cache,
                          dense_embedding_model = dense_embedding_model,
                          spare_embedding_model = spare_embedding_model,
                          distance = distance,
                          embedding_folder_cached = embedding_folder_cached,
+                         semantic_cache_threshold = semantic_cache_threshold,
                          shard_number = shard_number,
                          quantization_mode = quantization_mode,
                          default_segment_number = default_segment_number,
                          on_disk = on_disk)
-
-        # assert collection_name, "Collection name must be string"
-        self._client = AsyncQdrantClient(url = url,
-                                         port = port,
-                                         grpc_port = grpc_port,
-                                         api_key = api_key,
-                                         prefer_grpc = prefer_grpc)
+        # Define AsyncClient
+        self._client = AsyncQdrantClient(url=url,
+                                          port=port,
+                                          grpc_port=grpc_port,
+                                          api_key=api_key,
+                                          prefer_grpc=prefer_grpc)
         # Set embed model
         self._set_embed_model()
         # Set hybrid mode
-        self._set_hybrid_mode()
+        self._set_hybrid_mode(enable = self.enable_hybrid)
+
+
+    async def _set_cache_collection(self):
+        """Enable when set semantic cache search"""
+        # Check collection exists
+        status = await self._client.collection_exists(self.collection_name)
+
+        # Sparse vector
+        sparse_vector_config = None
+        if self.enable_hybrid:
+            sparse_vector_config = self._client.get_fastembed_sparse_vector_params()
+
+        # When cache collection is not exists
+        if status:
+            # Define cache collection name
+            collection_info = await self._collection_info(collection_name = self.collection_name)
+            # Get vector config
+            vector_config = collection_info.config.params.vectors
+            # Create cache collection from main
+            cache_status = await self._client.collection_exists(collection_name = self.cache_collection_name)
+            # Create when cache collection isn't exist.
+            if not cache_status:
+                await self._client.create_collection(collection_name = self.cache_collection_name,
+                                                     vectors_config = vector_config,
+                                                     sparse_vectors_config = sparse_vector_config)
+            # May need to enhance quality
+
+    async def _semantic_cache_search(self,
+                                     query :str,
+                                     semantic_cache_threshold: float,
+                                     similarity_top_k :int = 3,
+                                     cache_similarity_top_k :int = 3,
+                                     filter :Optional[Filter] = None) -> Sequence[NodeWithScore]:
+        """
+        Semantic Cache Search flows
+        :param query: The search query (Required)
+        :type query: str
+        :param semantic_cache_threshold: The threshold for retrieving from cache collection.
+        :type semantic_cache_threshold: float
+        :param similarity_top_k: Top k result from similarity search with base collection
+        :type similarity_top_k: int
+        :param cache_similarity_top_k: Top k result from similarity search with cache collection
+        :type cache_similarity_top_k: int
+        :param filter: Conditional filter
+        :type filter: Filter
+        :return: Return a sequence of NodeWithScore
+        :rtype: Sequence
+        """
+
+        # Count cache point
+        cache_points = await self._count_points(collection_name = self.cache_collection_name)
+        # If zero points in cached collection
+        if cache_points == 0:
+            nodes = await self.__query(collection_name = self.collection_name,
+                                       query = query,
+                                       similarity_top_k = similarity_top_k,
+                                       filter = filter,
+                                       return_type = "NodeWithScore")
+            # Convert NodeWithScore to TextNode
+            base_nodes = [node.node for node in nodes]
+            # Add point to cache collection
+            await self.insert_documents(documents = base_nodes,
+                                        collection_name = self.cache_collection_name)
+            return nodes
+        else:
+            # Search with cache collection
+            cache_nodes = await self.__query(collection_name = self.cache_collection_name,
+                                             query = query,
+                                             similarity_top_k = cache_similarity_top_k,
+                                             filter = filter,
+                                             score_threshold = semantic_cache_threshold,
+                                             return_type = "NodeWithScore")
+            # When find out nodes satisfied threshold condition.
+            if len(cache_nodes) > 0:
+                return cache_nodes
+
+            # When no nodes in cache collection achieved!
+            nodes = await self.__query(collection_name = self.collection_name,
+                                       query = query,
+                                       similarity_top_k = similarity_top_k,
+                                       filter = filter,
+                                       return_type = "NodeWithScore")
+
+            # Convert NodeWithScore to TextNode
+            base_nodes = [node.node for node in nodes]
+            # Add node to cache collection (Only add non duplicated nodes)
+            await self.insert_documents(documents = base_nodes,
+                                        collection_name = self.cache_collection_name)
+            return nodes
 
     async def __create_collection(self,
                                   collection_name :str,
@@ -185,36 +269,6 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                 optimizer_config = models.OptimizersConfigDiff(indexing_threshold = 20000),
             )
 
-    async def __get_embeddings(self,
-                               texts :list[str],
-                               embedding_model : BaseEmbedding,
-                               batch_size :int,
-                               num_workers :int,
-                               show_progress :bool = True) -> List[Embedding]:
-        """
-        Return embedding from documents
-
-        Args:
-            texts (list[str]): List of input text
-            embedding_model (BaseEmbedding): The text embedding model
-            batch_size (int): The desired batch size
-            num_workers (int): The desired num workers
-            show_progress (bool): Indicate show progress or not
-
-        Returns:
-             Return list of Embedding
-        """
-
-        # Set batch size and num workers
-        embedding_model.num_workers = num_workers
-        embedding_model.embed_batch_size = batch_size
-        # Other information
-        model_infor = embedding_model.dict()
-        callback_manager = embedding_model.callback_manager
-        # Return embedding
-        embeddings = await embedding_model.aget_text_embedding_batch(texts = texts, show_progress = show_progress)
-        return embeddings
-
     async def __insert_points(self,
                               list_embeddings :list[list[float]],
                               list_payloads :list[dict],
@@ -241,7 +295,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             point_ids = [str(uuid4()) for i in range(len(list_embeddings))]
 
         # Collection name
-        collection_name = collection_name if collection_name != None else self._collection_name
+        collection_name = collection_name if collection_name != None else self.collection_name
         # Upload point
         await self._client.upsert(collection_name = collection_name,
                                   points = models.Batch(
@@ -251,7 +305,8 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                   ))
 
     async def insert_documents(self,
-                               documents :Sequence[BaseNode],
+                               documents: Sequence[BaseNode],
+                               collection_name: Optional[str] = None,
                                embedded_batch_size: int = 64,
                                embedded_num_workers: Optional[int] = None,
                                upload_batch_size: int = 16,
@@ -271,18 +326,20 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         :type upload_parallel: Optional[int]
         """
 
+        # Get collection name
+        if collection_name == None: collection_name = self.collection_name
         # Get content and its embedding
         contents = [doc.get_content() for doc in documents]
         embeddings = None
 
         # Define dense embedding
-        if isinstance(self._dense_embedding_model, BaseEmbedding):
+        if isinstance(self.dense_embedding_model, BaseEmbedding):
             # With LlamaIndex Embedding
             # Get embedding model name
-            model_name = self._dense_embedding_model.model_name
+            model_name = self.dense_embedding_model.model_name
             # Define embedding
             embeddings = await self.__get_embeddings(texts = contents,
-                                                     embedding_model = self._dense_embedding_model,
+                                                     embedding_model = self.dense_embedding_model,
                                                      batch_size = embedded_batch_size,
                                                      num_workers = embedded_num_workers)
 
@@ -290,9 +347,9 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             embedding_dimension = len(embeddings[0])
             # Define vector config
             dense_vectors_config = VectorParams(size = embedding_dimension,
-                                                distance = self._distance,
-                                                on_disk = self._on_disk,
-                                                hnsw_config = models.HnswConfigDiff(on_disk = self._on_disk))
+                                                distance = self.distance,
+                                                on_disk = self.on_disk,
+                                                hnsw_config = models.HnswConfigDiff(on_disk = self.on_disk))
         else:
             # When embedding model is str, default is activated with FastEmbed model
             dense_vectors_config = self._client.get_fastembed_vector_params()
@@ -301,23 +358,28 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
 
         sparse_embedding_model = None
         # Hybrid Search enabled
-        if self._hybrid_search:
+        if self.enable_hybrid:
             sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
 
         # Define payloads
-        payloads = self._convert_documents_to_payloads(documents = documents,
-                                                       embedding_model_name = model_name)
+        payloads = self.convert_documents_to_payloads(documents = documents,
+                                                      embedding_model_name = model_name)
 
         # Create collection if doesn't exist!
-        await self.__create_collection(collection_name = self._collection_name,
+        await self.__create_collection(collection_name = collection_name,
                                        dense_vectors_config = dense_vectors_config,
                                        sparse_vectors_config = sparse_embedding_model,
-                                       shard_number = self._shard_number,
-                                       quantization_mode = self._quantization_mode,
-                                       default_segment_number = self._default_segment_number)
+                                       shard_number = self.shard_number,
+                                       quantization_mode = self.quantization_mode,
+                                       default_segment_number = self.default_segment_number)
+
+        # Create cache collection, if enabled:
+        if self.enable_semantic_cache:
+            # Set semantic cache
+            await self._set_cache_collection()
 
         # Insert vector to collection
-        if isinstance(self._dense_embedding_model, BaseEmbedding):
+        if isinstance(self.dense_embedding_model, BaseEmbedding):
             # With BaseEmbedding model
             await self.__insert_points(list_embeddings = embeddings,
                                        list_payloads = payloads,
@@ -325,11 +387,188 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                        parallel = upload_parallel)
         else:
             # With FastEmbed Model
-            await self._client.add(collection_name = self._collection_name,
+            await self._client.add(collection_name = collection_name,
                                    documents = contents,
                                    metadata = payloads,
                                    batch_size = upload_batch_size,
                                    parallel = upload_parallel)
+
+    async def retrieve(self,
+                       query :str,
+                       similarity_top_k :int = 3,
+                       filter :Optional[Filter] = None) -> Sequence[NodeWithScore]:
+        """
+        Retrieve nodes from vector store corresponding to question.
+
+        :param query: The query str for retrieve (Required)
+        :type query: str
+        :param similarity_top_k: Default is 3. Return top-k element from retrieval.
+        :type similarity_top_k: int
+        :param filter: Conditional filter for searching. Default is None
+        :type filter: Filter
+        :return: Return a sequence of NodeWithScore
+        :rtype Sequence[NodeWithScore]
+        """
+
+        # Check base collection
+        status = await self._client.collection_exists(collection_name = self.collection_name)
+        if not status:
+            raise Exception(f"Collection {self.collection_name} isn't existed")
+        # Check collection
+        count_points = await self._count_points(collection_name = self.collection_name)
+        if count_points == 0:
+            raise Exception(f"Collection {self.collection_name} is empty!")
+        # Create cache collection
+        await self._set_cache_collection()
+
+        # If semantic cache enabled
+        if self.enable_semantic_cache:
+            # Check cache collection
+            status = await self._client.collection_exists(collection_name = self.cache_collection_name)
+            if not status:
+                raise Exception(f"Collection {self.cache_collection_name} not existed")
+
+            # Enable semantic cache search
+            nodes = await self._semantic_cache_search(query = query,
+                                                      semantic_cache_threshold = self.semantic_cache_threshold,
+                                                      similarity_top_k = similarity_top_k,
+                                                      cache_similarity_top_k = similarity_top_k,
+                                                      filter = filter)
+            return nodes
+
+        else:
+            # Enable base search
+            nodes = await self.__query(collection_name = self.collection_name,
+                                       query = query,
+                                       similarity_top_k = similarity_top_k,
+                                       filter = filter,
+                                       return_type = "NodeWithScore")
+            return nodes
+
+    async def __query(self,
+                      collection_name :str,
+                      query: str,
+                      similarity_top_k: int = 3,
+                      filter: Optional[Filter] = None,
+                      score_threshold :Optional[float] = None,
+                      rescore :bool = True,
+                      return_type :Literal["NodeWithScore","default"] = "NodeWithScore"
+                      ) -> Union[Sequence[NodeWithScore],List[models.ScoredPoint],List[models.QueryResponse]]:
+        """
+        Retrieve nodes from vector store corresponding to question.
+
+        :param query: The query str for retrieve (Required)
+        :type query: str
+        :param similarity_top_k: Default is 3. Return top-k element from retrieval.
+        :type similarity_top_k: int
+        :param filter: Conditional filter for searching. Default is None
+        :type filter: Filter
+        :return: Return a sequence of NodeWithScore
+        :rtype Sequence[NodeWithScore]
+        """
+
+        # With LlamaIndex Embedding case
+        if isinstance(self.dense_embedding_model, BaseEmbedding):
+            # Get query embedding
+            query_embedding = await self.dense_embedding_model.aget_query_embedding(query = query)
+
+            search_params = None
+            # Disable rescore method
+            if not rescore:
+                search_params = models.SearchParams(
+                    quantization = models.QuantizationSearchParams(rescore=False)
+                )
+            # Return search
+            scored_points = await self._client.search(collection_name = collection_name,
+                                                      query_vector = query_embedding,
+                                                      limit = similarity_top_k,
+                                                      search_params = search_params,
+                                                      query_filter = filter,
+                                                      score_threshold = score_threshold)
+            # Convert to node with score
+            return self.convert_score_point_to_node_with_score(scored_points = scored_points) if return_type == "NodeWithScore" else scored_points
+
+        else:
+            # With FastEmbed model
+            # Get nodes
+            scored_points = await self._client.query(query_text = query,
+                                                     collection_name = collection_name,
+                                                     query_filter = filter,
+                                                     limit = similarity_top_k,
+                                                     score_threshold = score_threshold)
+            # Convert to node with score
+            return self.convert_query_response_to_node_with_score(scored_points = scored_points) if return_type == "NodeWithScore" else scored_points
+
+    async def _collection_info(self, collection_name :str) -> types.CollectionInfo:
+        """Return collection info"""
+        # Check collection exist
+        status = await self._client.collection_exists(collection_name)
+        if not status:
+            raise Exception(f"Collection {collection_name} is not exist!")
+        # Return information
+        return await self._client.get_collection(collection_name = collection_name)
+
+    async def _count_points(self, collection_name :str) -> int:
+        """Return the total amount of point inside collection"""
+        # Check collection exist
+        status = await self._client.collection_exists(collection_name)
+        if not status:
+            raise Exception(f"Collection {collection_name} is not exist!")
+        # Get total amount of points
+        result = await self._client.count(collection_name = collection_name)
+        return result.count
+
+    async def _get_points(self,
+                          collection_name :str,
+                          limit :Optional[int] = "all",
+                          with_vector :bool = False) -> Tuple[List[types.Record], Optional[types.PointId]]:
+        """
+        Get all the point in the Qdrant collection or with limited amount
+
+        Args:
+            limit (int, optional): The number of point retrieved. Default is all.
+            with_vector (bool): Whether return vector or not.
+        """
+        # Get total point
+        total_points = await self._count_points(collection_name = collection_name)
+
+        # Limit if specify
+        if limit == "all": limit = total_points
+        # Return point
+        result = await self._client.scroll(collection_name = collection_name,
+                                           limit = limit,
+                                           with_vectors = with_vector)
+        return result
+
+    @staticmethod
+    async def __get_embeddings(texts: list[str],
+                               embedding_model: BaseEmbedding,
+                               batch_size: int,
+                               num_workers: int,
+                               show_progress: bool = True) -> List[Embedding]:
+        """
+        Return embedding from documents
+
+        Args:
+            texts (list[str]): List of input text
+            embedding_model (BaseEmbedding): The text embedding model
+            batch_size (int): The desired batch size
+            num_workers (int): The desired num workers
+            show_progress (bool): Indicate show progress or not
+
+        Returns:
+             Return list of Embedding
+        """
+
+        # Set batch size and num workers
+        embedding_model.num_workers = num_workers
+        embedding_model.embed_batch_size = batch_size
+        # Other information
+        model_infor = embedding_model.dict()
+        callback_manager = embedding_model.callback_manager
+        # Return embedding
+        embeddings = await embedding_model.aget_text_embedding_batch(texts=texts, show_progress=show_progress)
+        return embeddings
 
     async def reembedding_with_collection(self,
                                           embedding_model : BaseEmbedding,
@@ -340,7 +579,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                           show_progress :bool = True) -> None:
         """Re-embedding the existed collection to another collection"""
         # Get points from current collection
-        points,_ = self._get_points()
+        points,_ = self._get_points(collection_name = collection_name)
 
         # Check length of points
         if len(points) == 0:
@@ -368,15 +607,15 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         if collection_name == None:
             # When not specify
             id = str(uuid4().fields[-1])[:5]
-            collection_name = f"{self._collection_name}_{id}"
+            collection_name = f"{self.collection_name}_{id}"
 
         # Get embedding dimension
         embedding_dimension = len(embeddings[0])
         # Define vector config
         dense_vectors_config = VectorParams(size = embedding_dimension,
-                                            distance = self._distance,
-                                            on_disk = self._on_disk,
-                                            hnsw_config = models.HnswConfigDiff(on_disk=self._on_disk))
+                                            distance = self.distance,
+                                            on_disk = self.on_disk,
+                                            hnsw_config = models.HnswConfigDiff(on_disk = self.on_disk))
         # Create collection if doesn't exist!
         await self.__create_collection(collection_name = collection_name,
                                        dense_vectors_config = dense_vectors_config)
@@ -387,108 +626,3 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                    list_payloads = payloads,
                                    point_ids = points_ids,
                                    batch_size = upload_batch_size)
-
-    async def __search(self,
-                       query_vector: List[Num],
-                       filter : Optional[models.Filter] = None,
-                       similarity_top_k :int = 3,
-                       rescore :bool = True) -> List[types.ScoredPoint]:
-        """
-        Search and return top-k result from input embedding vector
-
-        Args:
-            query_vector (List[Num]): List of value represent for sematic embedding of query.
-            filter (Filter): Filter the result under conditions.
-            similarity_top_k (int): Determine the number of result should be returned.
-            rescore (bool): Disable rescoring, which will reduce the number of disk reads, but slightly decrease the precision
-        Returns:
-            List[types.ScoredPoint]
-        """
-
-        # Check collection
-        if not await self._client.collection_exists(self._collection_name):
-            raise Exception(f"Collection {self._collection_name} isn't existed!")
-
-        # Search params
-        # search_params = models.SearchParams(hnsw_ef=512, exact=False)
-        search_params = None
-        # Disable rescore method
-        if not rescore:
-            search_params = models.SearchParams(
-                quantization = models.QuantizationSearchParams(rescore = False)
-            )
-
-        # Return search
-        result = await self._client.search(collection_name = self._collection_name,
-                                           query_vector = query_vector,
-                                           limit = similarity_top_k,
-                                           search_params = search_params,
-                                           query_filter = filter)
-        return result
-
-    async def retrieve(self,
-                       query :str,
-                       similarity_top_k :int = 3) -> Sequence[NodeWithScore]:
-        """
-        Retrieve nodes from vector store corresponding to question.
-
-        :parameter query: The query str for retrieve.
-        :type query: str
-        :parameter similarity_top_k: Default is 3. Return top-k element from retrieval.
-        :type similarity_top_k: int
-        :return: Return a sequence of NodeWithScore
-        :rtype Sequence[NodeWithScore]
-        """
-
-        # Check collection
-        if not self._client.collection_exists(collection_name = self._collection_name):
-            raise Exception(f"Collection {self._collection_name} not existed")
-
-        # With LlamaIndex Embedding case
-        if isinstance(self._dense_embedding_model, BaseEmbedding):
-            # Get query embedding
-            query_embedding = await self._dense_embedding_model.aget_query_embedding(query = query)
-            # Get nodes
-            scored_points = await self.__search(query_vector = query_embedding,
-                                                similarity_top_k = similarity_top_k)
-            # Convert to node with score
-            return self._convert_score_point_to_node_with_score(scored_points=scored_points)
-        else:
-            # With FastEmbed model
-            # Get nodes
-            scored_points = await self._client.query(query_text = query,
-                                                     collection_name = self._collection_name,
-                                                     limit = similarity_top_k)
-            # Convert to node with score
-            return self._convert_query_response_to_node_with_score(scored_points = scored_points)
-
-    async def _collection_info(self) -> types.CollectionInfo:
-        """Return collection info"""
-        return await self._client.get_collection(self._collection_name)
-
-    async def _count_points(self) -> int:
-        """Return the total amount of point inside collection"""
-        # Get total amount of points
-        result = await self._client.count(self._collection_name)
-        return result.count
-
-    async def _get_points(self,
-                          limit :Optional[int] = "all",
-                          with_vector :bool = False) -> Tuple[List[types.Record], Optional[types.PointId]]:
-        """
-        Get all the point in the Qdrant collection or with limited amount
-
-        Args:
-            limit (int, optional): The number of point retrieved. Default is all.
-            with_vector (bool): Whether return vector or not.
-        """
-        # Get total point
-        total_points = await self._count_points()
-
-        # Limit if specify
-        if limit == "all": limit = total_points
-        # Return point
-        result = await self._client.scroll(collection_name = self._collection_name,
-                                           limit = limit,
-                                           with_vectors = with_vector)
-        return result
