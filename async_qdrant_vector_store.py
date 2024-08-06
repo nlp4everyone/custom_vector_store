@@ -414,6 +414,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         status = await self._client.collection_exists(collection_name = self.collection_name)
         if not status:
             raise Exception(f"Collection {self.collection_name} isn't existed")
+
         # Check collection
         count_points = await self._count_points(collection_name = self.collection_name)
         if count_points == 0:
@@ -423,11 +424,6 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
 
         # If semantic cache enabled
         if self.enable_semantic_cache:
-            # Check cache collection
-            status = await self._client.collection_exists(collection_name = self.cache_collection_name)
-            if not status:
-                raise Exception(f"Collection {self.cache_collection_name} not existed")
-
             # Enable semantic cache search
             nodes = await self._semantic_cache_search(query = query,
                                                       semantic_cache_threshold = self.semantic_cache_threshold,
@@ -498,6 +494,8 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                                      score_threshold = score_threshold)
             # Convert to node with score
             return self.convert_query_response_to_node_with_score(scored_points = scored_points) if return_type == "NodeWithScore" else scored_points
+
+
 
     async def _collection_info(self, collection_name :str) -> types.CollectionInfo:
         """Return collection info"""
