@@ -13,7 +13,7 @@ Num = Union[int, float]
 Embedding = List[float]
 
 # Params
-_DEFAULT_UPLOAD_BATCH_SIZE = 64
+_DEFAULT_UPLOAD_BATCH_SIZE = 16
 
 class QdrantVectorStore():
     def __init__(self,
@@ -77,23 +77,27 @@ class QdrantVectorStore():
                                     grpc_port = grpc_port,
                                     api_key = api_key,
                                     prefer_grpc = prefer_grpc)
-        # Set value
+        # Collection name
         self.collection_name = collection_name
+        # Hybrid search
         self.enable_hybrid = enable_hybrid
-        self.enable_semantic_cache = enable_semantic_cache
+        # Optimization params
         self.on_disk = on_disk
         self.distance = distance
-        self.dense_embedding_model = dense_embedding_model
         self.shard_number = shard_number
         self.quantization_mode = quantization_mode
         self.default_segment_number = default_segment_number
-        self.cache_collection_name = f"cache_{self.collection_name}"
+        # Semantic cache
+        self.enable_semantic_cache = enable_semantic_cache
         self.semantic_cache_threshold = semantic_cache_threshold
-        self.spare_embedding_model = spare_embedding_model
+        self.cache_collection_name = f"cache_{self.collection_name}"
+        # Embedding model
+        self.dense_embedding_model = dense_embedding_model
+        self.sparse_embedding_model = spare_embedding_model
         self.embedding_folder_cached = embedding_folder_cached
 
         # Set embed model
-        self._set_embed_model()
+        self._set_dense_model()
         # Set hybrid mode
         self._set_hybrid_mode(enable = self.enable_hybrid)
 
@@ -105,15 +109,15 @@ class QdrantVectorStore():
             sparse_supported_models = SparseTextEmbedding.list_supported_models()
             sparse_supported_models = [model['model'] for model in sparse_supported_models]
 
-            if isinstance(self.spare_embedding_model, str):
+            if isinstance(self.sparse_embedding_model, str):
                 # Check Dense EmbedModel is available
-                if self.spare_embedding_model not in sparse_supported_models:
-                    raise Exception(f"{self.spare_embedding_model} is not supported!")
+                if self.sparse_embedding_model not in sparse_supported_models:
+                    raise Exception(f"{self.sparse_embedding_model} is not supported!")
             # Set model
-            self._client.set_sparse_model(embedding_model_name = self.spare_embedding_model,
+            self._client.set_sparse_model(embedding_model_name = self.sparse_embedding_model,
                                            cache_dir = self.embedding_folder_cached)
 
-    def _set_embed_model(self):
+    def _set_dense_model(self):
         """Set local embedding model (FastEmbed) if enabled"""
         # If FastEmbed dense model enabled
         if isinstance(self.dense_embedding_model, str):
@@ -269,6 +273,13 @@ class QdrantVectorStore():
             # which will be overwritten by the next batch.
             optimizers_config = models.OptimizersConfigDiff(default_segment_number = default_segment_number,
                                                             indexing_threshold = 0)
+
+            if isinstance(self.dense_embedding_model,BaseEmbedding):
+                # Just dense case
+                model_name = self.dense_embedding_model.model_name
+                dense_vectors_config = {model_name :dense_vectors_config}
+                # Hybrid case
+
             # Create collection
             self._client.create_collection(
                 collection_name = collection_name,
@@ -311,16 +322,17 @@ class QdrantVectorStore():
         if point_ids == None:
             point_ids = [str(uuid4()) for i in range(len(list_embeddings))]
 
-        # Collection name
-        if collection_name == None: collection_name = self.collection_name
+        # Define model name
+        model_name = self.dense_embedding_model.model_name
+        # Define point
+        points = [models.PointStruct(id = point_ids[i],
+                                     vector = {model_name: embedding},
+                                     payload = list_payloads[i]) for (i, embedding) in enumerate(list_embeddings)]
 
-        # Upload point
-        self._client.upload_collection(collection_name = collection_name,
-                                       ids = point_ids,
-                                       vectors = list_embeddings,
-                                       payload = list_payloads,
-                                       batch_size = batch_size,
-                                       parallel = parallel)
+        self._client.upload_points(collection_name = collection_name,
+                                   points = points,
+                                   batch_size = batch_size,
+                                   parallel = parallel)
 
     def insert_documents(self,
                          documents :Sequence[BaseNode],
@@ -328,7 +340,7 @@ class QdrantVectorStore():
                          embedded_batch_size: int = 64,
                          embedded_num_workers: Optional[int] = None,
                          upload_batch_size: int = 16,
-                         upload_parallel :Optional[int] = None) -> None:
+                         upload_parallel :Optional[int] = 1) -> None:
         """
         Insert document to collection.
 
@@ -378,11 +390,12 @@ class QdrantVectorStore():
         sparse_embedding_model = None
         # Hybrid Search enbable
         if self.enable_hybrid:
-            sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
+            # FastEmbed Sparse Embedding case
+            if isinstance(self.sparse_embedding_model, str):
+                sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
 
         # Define payloads
-        payloads = self.convert_documents_to_payloads(documents = documents,
-                                                       embedding_model_name = model_name)
+        payloads = self.convert_documents_to_payloads(documents = documents)
         # Create collection if doesn't exist!
         self.__create_collection(collection_name = collection_name,
                                  dense_vectors_config = dense_vectors_config,
@@ -400,12 +413,13 @@ class QdrantVectorStore():
         if isinstance(self.dense_embedding_model, BaseEmbedding):
             # With BaseEmbedding model
             self.__insert_points(list_embeddings = embeddings,
+                                 collection_name = collection_name,
                                  list_payloads = payloads,
                                  batch_size = upload_batch_size,
                                  parallel = upload_parallel)
         else:
             # With FastEmbed Model
-            self._client.add(collection_name = self.collection_name,
+            self._client.add(collection_name = collection_name,
                              documents = contents,
                              metadata = payloads,
                              batch_size = upload_batch_size,
@@ -444,9 +458,13 @@ class QdrantVectorStore():
                 search_params = models.SearchParams(
                     quantization = models.QuantizationSearchParams(rescore=False)
                 )
+            # Model name
+            model_name = self.dense_embedding_model.model_name
+            query_vector = (model_name, query_embedding)
             # Return search
             scored_points = self._client.search(collection_name = collection_name,
-                                                query_vector = query_embedding,limit = similarity_top_k,
+                                                query_vector = query_vector,
+                                                limit = similarity_top_k,
                                                 search_params = search_params,
                                                 query_filter = filter,
                                                 score_threshold = score_threshold)
@@ -585,9 +603,7 @@ class QdrantVectorStore():
         return embedding_model.get_text_embedding_batch(texts=texts, show_progress=show_progress)
 
     @staticmethod
-    def convert_documents_to_payloads(documents: Sequence[BaseNode],
-                                      embedding_model_name: Optional[str] = None,
-                                      include_embedding_name: bool = True) -> list[dict]:
+    def convert_documents_to_payloads(documents: Sequence[BaseNode]) -> list[dict]:
         """
         Construct the payload data from LlamaIndex document/node datatype
 
@@ -617,10 +633,6 @@ class QdrantVectorStore():
                      "doc_id": document.id_,
                      "document_id": document.id_,
                      "ref_doc_id": document.id_} for document in documents]
-
-        # Include embedding name if specify
-        if include_embedding_name and embedding_model_name != None:
-            for i in range(len(payloads)): payloads[i].update({"embedding_model_name": embedding_model_name})
         return payloads
 
     @staticmethod

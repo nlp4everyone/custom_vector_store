@@ -14,7 +14,7 @@ Num = Union[int, float]
 Embedding = List[float]
 
 # Params
-_DEFAULT_UPLOAD_BATCH_SIZE = 64
+_DEFAULT_UPLOAD_BATCH_SIZE = 16
 
 
 class AsyncQdrantVectorStore(QdrantVectorStore):
@@ -97,7 +97,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                           api_key=api_key,
                                           prefer_grpc=prefer_grpc)
         # Set embed model
-        self._set_embed_model()
+        self._set_dense_model()
         # Set hybrid mode
         self._set_hybrid_mode(enable = self.enable_hybrid)
 
@@ -148,7 +148,6 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         :return: Return a sequence of NodeWithScore
         :rtype: Sequence
         """
-
         # Count cache point
         cache_points = await self._count_points(collection_name = self.cache_collection_name)
         # If zero points in cached collection
@@ -254,6 +253,13 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             # which will be overwritten by the next batch.
             optimizers_config = models.OptimizersConfigDiff(default_segment_number = default_segment_number,
                                                             indexing_threshold = 0)
+            # BaseEmbedding case for annotating
+            if isinstance(self.dense_embedding_model,BaseEmbedding):
+                # Just dense case
+                model_name = self.dense_embedding_model.model_name
+                dense_vectors_config = {model_name :dense_vectors_config}
+                # Hybrid case
+
             # Create collection
             await self._client.create_collection(
                 collection_name = collection_name,
@@ -294,15 +300,25 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         if point_ids == None:
             point_ids = [str(uuid4()) for i in range(len(list_embeddings))]
 
-        # Collection name
-        collection_name = collection_name if collection_name != None else self.collection_name
         # Upload point
-        await self._client.upsert(collection_name = collection_name,
-                                  points = models.Batch(
-                                      ids = point_ids,
-                                      payloads = list_payloads,
-                                      vectors = list_embeddings
-                                  ))
+        # await self._client.upsert(collection_name = collection_name,
+        #                           points = models.Batch(
+        #                               ids = point_ids,
+        #                               payloads = list_payloads,
+        #                               vectors = list_embeddings
+        #                           ))
+
+        # Define model name
+        model_name = self.dense_embedding_model.model_name
+        # Define point
+        points = [models.PointStruct(id = point_ids[i],
+                                     vector = {model_name : embedding},
+                                     payload = list_payloads[i]) for (i,embedding) in enumerate(list_embeddings)]
+
+        await self._client.upload_points(collection_name = collection_name,
+                                         points = points,
+                                         batch_size = batch_size,
+                                         parallel = parallel)
 
     async def insert_documents(self,
                                documents: Sequence[BaseNode],
@@ -310,7 +326,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                embedded_batch_size: int = 64,
                                embedded_num_workers: Optional[int] = None,
                                upload_batch_size: int = 16,
-                               upload_parallel :Optional[int] = None) -> None:
+                               upload_parallel :Optional[int] = 1) -> None:
         """
         Insert document to collection.
 
@@ -334,9 +350,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
 
         # Define dense embedding
         if isinstance(self.dense_embedding_model, BaseEmbedding):
-            # With LlamaIndex Embedding
-            # Get embedding model name
-            model_name = self.dense_embedding_model.model_name
+            # With BaseEmbedding
             # Define embedding
             embeddings = await self.__get_embeddings(texts = contents,
                                                      embedding_model = self.dense_embedding_model,
@@ -353,17 +367,16 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         else:
             # When embedding model is str, default is activated with FastEmbed model
             dense_vectors_config = self._client.get_fastembed_vector_params()
-            # Get params
-            model_name = list(dense_vectors_config)[0]
 
         sparse_embedding_model = None
         # Hybrid Search enabled
         if self.enable_hybrid:
-            sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
+            # FastEmbed Sparse Embedding case
+            if isinstance(self.sparse_embedding_model,str):
+                sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
 
         # Define payloads
-        payloads = self.convert_documents_to_payloads(documents = documents,
-                                                      embedding_model_name = model_name)
+        payloads = self.convert_documents_to_payloads(documents = documents)
 
         # Create collection if doesn't exist!
         await self.__create_collection(collection_name = collection_name,
@@ -372,7 +385,6 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                        shard_number = self.shard_number,
                                        quantization_mode = self.quantization_mode,
                                        default_segment_number = self.default_segment_number)
-
         # Create cache collection, if enabled:
         if self.enable_semantic_cache:
             # Set semantic cache
@@ -382,6 +394,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         if isinstance(self.dense_embedding_model, BaseEmbedding):
             # With BaseEmbedding model
             await self.__insert_points(list_embeddings = embeddings,
+                                       collection_name = collection_name,
                                        list_payloads = payloads,
                                        batch_size = upload_batch_size,
                                        parallel = upload_parallel)
@@ -474,13 +487,24 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                 search_params = models.SearchParams(
                     quantization = models.QuantizationSearchParams(rescore=False)
                 )
+            # Model name
+            model_name = self.dense_embedding_model.model_name
+            query_vector = (model_name,query_embedding)
             # Return search
             scored_points = await self._client.search(collection_name = collection_name,
-                                                      query_vector = query_embedding,
+                                                      query_vector = query_vector,
                                                       limit = similarity_top_k,
                                                       search_params = search_params,
                                                       query_filter = filter,
                                                       score_threshold = score_threshold)
+            # scored_points = await self._client.query_points(collection_name = collection_name,
+            #                                                 prefetch = [models.Prefetch(
+            #                                                     query = query_embedding
+            #
+            #                                                 )],
+            #                                                 limit = similarity_top_k)
+            # print(scored_points)
+            # return
             # Convert to node with score
             return self.convert_score_point_to_node_with_score(scored_points = scored_points) if return_type == "NodeWithScore" else scored_points
 
