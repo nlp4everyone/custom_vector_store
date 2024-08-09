@@ -97,9 +97,9 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                           api_key=api_key,
                                           prefer_grpc=prefer_grpc)
         # Set embed model
-        self._set_dense_model()
+        # self._set_dense_model()
         # Set hybrid mode
-        self._set_hybrid_mode(enable = self.enable_hybrid)
+        # self._set_hybrid_mode(enable = self.enable_hybrid)
 
 
     async def _set_cache_collection(self):
@@ -253,12 +253,6 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             # which will be overwritten by the next batch.
             optimizers_config = models.OptimizersConfigDiff(default_segment_number = default_segment_number,
                                                             indexing_threshold = 0)
-            # BaseEmbedding case for annotating
-            if isinstance(self.dense_embedding_model,BaseEmbedding):
-                # Just dense case
-                model_name = self.dense_embedding_model.model_name
-                dense_vectors_config = {model_name :dense_vectors_config}
-                # Hybrid case
 
             # Create collection
             await self._client.create_collection(
@@ -276,9 +270,11 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             )
 
     async def __insert_points(self,
-                              list_embeddings :list[list[float]],
-                              list_payloads :list[dict],
+                              payloads: list[dict],
+                              dense_embeddings: Optional[list[list[float]]] = None,
+                              sparse_embeddings :Optional[list[dict]] = None,
                               point_ids: Optional[list[str]] = None,
+                              mode :Literal["dense","hybrid"] = "dense",
                               collection_name :Optional[str] = None,
                               batch_size :int = _DEFAULT_UPLOAD_BATCH_SIZE,
                               parallel :int = 1) -> None:
@@ -295,26 +291,28 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         """
 
         # Check size
-        if not len(list_embeddings) == len(list_payloads):
-            raise Exception("Number of embeddings must be equal with number of payloads")
+        # if not len(list_embeddings) == len(list_payloads):
+        #     raise Exception("Number of embeddings must be equal with number of payloads")
         if point_ids == None:
-            point_ids = [str(uuid4()) for i in range(len(list_embeddings))]
-
-        # Upload point
-        # await self._client.upsert(collection_name = collection_name,
-        #                           points = models.Batch(
-        #                               ids = point_ids,
-        #                               payloads = list_payloads,
-        #                               vectors = list_embeddings
-        #                           ))
+            point_ids = [str(uuid4()) for i in range(len(payloads))]
 
         # Define model name
-        model_name = self.dense_embedding_model.model_name
-        # Define point
-        points = [models.PointStruct(id = point_ids[i],
-                                     vector = {model_name : embedding},
-                                     payload = list_payloads[i]) for (i,embedding) in enumerate(list_embeddings)]
+        dense_model = self.dense_embedding_model.model_name
+        # if isinstance(self.sparse_embedding_model, SparseTextEmbedding):
+        sparse_model = self.sparse_embedding_model.model_name
 
+        # Define point
+        if mode == "dense":
+            points = [models.PointStruct(id = point_ids[i],
+                                         vector = {dense_model : embedding},
+                                         payload = payloads[i]) for (i,embedding) in enumerate(dense_embeddings)]
+        else:
+            points = [models.PointStruct(id = point_ids[i],
+                                         vector = {dense_model: embedding,
+                                                   sparse_model: models.SparseVector(indices = sparse_embeddings[i]['indices'],
+                                                                                     values = sparse_embeddings[i]['values'])},
+                                         payload = payloads[i]) for (i, embedding) in enumerate(dense_embeddings)]
+        # Insert points
         await self._client.upload_points(collection_name = collection_name,
                                          points = points,
                                          batch_size = batch_size,
@@ -352,10 +350,10 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         if isinstance(self.dense_embedding_model, BaseEmbedding):
             # With BaseEmbedding
             # Define embedding
-            embeddings = await self.__get_embeddings(texts = contents,
-                                                     embedding_model = self.dense_embedding_model,
-                                                     batch_size = embedded_batch_size,
-                                                     num_workers = embedded_num_workers)
+            embeddings = await self.__get_dense_embeddings(texts = contents,
+                                                           embedding_model = self.dense_embedding_model,
+                                                           batch_size = embedded_batch_size,
+                                                           num_workers = embedded_num_workers)
 
             # Get embedding dimension
             embedding_dimension = len(embeddings[0])
@@ -364,16 +362,40 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                                                 distance = self.distance,
                                                 on_disk = self.on_disk,
                                                 hnsw_config = models.HnswConfigDiff(on_disk = self.on_disk))
+            # Model name
+            model_name = self.dense_embedding_model.model_name
+            # Dense config
+            dense_vectors_config = {model_name: dense_vectors_config}
+            # dense_vectors_config = {model_name: dense_vectors_config}
         else:
             # When embedding model is str, default is activated with FastEmbed model
             dense_vectors_config = self._client.get_fastembed_vector_params()
 
-        sparse_embedding_model = None
+        sparse_vectors_config = None
+        sparse_embeddings = None
         # Hybrid Search enabled
         if self.enable_hybrid:
             # FastEmbed Sparse Embedding case
-            if isinstance(self.sparse_embedding_model,str):
-                sparse_embedding_model = self._client.get_fastembed_sparse_vector_params()
+            if isinstance(self.sparse_embedding_model,SparseTextEmbedding):
+                # Sparse model name
+                sparse_model_name = self.sparse_embedding_model.model_name
+                # FastEmbed case
+                sparse_vectors_config = models.SparseVectorParams(
+                    index = models.SparseIndexParams(
+                        on_disk = False,
+                    )
+                )
+                sparse_vectors_config = {sparse_model_name : sparse_vectors_config}
+                # Get sparse embedding
+                sparse_embeddings = self.__get_sparse_embeddings(texts = contents,
+                                                                 embedding_model = self.sparse_embedding_model,
+                                                                 batch_size = embedded_batch_size,
+                                                                 num_workers = embedded_num_workers)
+
+            else:
+                # Built-in case
+                sparse_vectors_config = self._client.get_fastembed_sparse_vector_params()
+
 
         # Define payloads
         payloads = self.convert_documents_to_payloads(documents = documents)
@@ -381,7 +403,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         # Create collection if doesn't exist!
         await self.__create_collection(collection_name = collection_name,
                                        dense_vectors_config = dense_vectors_config,
-                                       sparse_vectors_config = sparse_embedding_model,
+                                       sparse_vectors_config = sparse_vectors_config,
                                        shard_number = self.shard_number,
                                        quantization_mode = self.quantization_mode,
                                        default_segment_number = self.default_segment_number)
@@ -390,12 +412,16 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             # Set semantic cache
             await self._set_cache_collection()
 
+        # Insert mode
+        mode = "hybrid" if self.enable_hybrid else "dense"
         # Insert vector to collection
         if isinstance(self.dense_embedding_model, BaseEmbedding):
             # With BaseEmbedding model
-            await self.__insert_points(list_embeddings = embeddings,
+            await self.__insert_points(dense_embeddings = embeddings,
+                                       sparse_embeddings = sparse_embeddings,
                                        collection_name = collection_name,
-                                       list_payloads = payloads,
+                                       mode = mode,
+                                       payloads = payloads,
                                        batch_size = upload_batch_size,
                                        parallel = upload_parallel)
         else:
@@ -458,6 +484,7 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
                       collection_name :str,
                       query: str,
                       similarity_top_k: int = 3,
+                      search_mode :Literal["dense","sparse"] = "dense",
                       filter: Optional[Filter] = None,
                       score_threshold :Optional[float] = None,
                       rescore :bool = True,
@@ -478,33 +505,42 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
 
         # With LlamaIndex Embedding case
         if isinstance(self.dense_embedding_model, BaseEmbedding):
-            # Get query embedding
-            query_embedding = await self.dense_embedding_model.aget_query_embedding(query = query)
+            if search_mode == "dense":
+                # Get query embedding
+                query_embedding = await self.dense_embedding_model.aget_query_embedding(query = query)
 
+                # Model name
+                dense_model = self.dense_embedding_model.model_name
+                query_vector = (dense_model, query_embedding)
+            else:
+                # Model name
+                sparse_vector = self.__get_sparse_embeddings(texts = [query],
+                                                             embedding_model = self.sparse_embedding_model,
+                                                             batch_size=1)
+                sparse_vector = sparse_vector[0]
+                # Get sparse model name
+                sparse_model = self.sparse_embedding_model.model_name
+                # Get query vector
+                query_vector = models.NamedSparseVector(
+                    name= sparse_model,
+                    vector=models.SparseVector(
+                        indices=sparse_vector["indices"],
+                        values=sparse_vector["values"],
+                    ),
+                )
+            # Define search params
             search_params = None
             # Disable rescore method
             if not rescore:
                 search_params = models.SearchParams(
-                    quantization = models.QuantizationSearchParams(rescore=False)
+                    quantization=models.QuantizationSearchParams(rescore=False)
                 )
-            # Model name
-            model_name = self.dense_embedding_model.model_name
-            query_vector = (model_name,query_embedding)
-            # Return search
+
             scored_points = await self._client.search(collection_name = collection_name,
                                                       query_vector = query_vector,
                                                       limit = similarity_top_k,
                                                       search_params = search_params,
-                                                      query_filter = filter,
-                                                      score_threshold = score_threshold)
-            # scored_points = await self._client.query_points(collection_name = collection_name,
-            #                                                 prefetch = [models.Prefetch(
-            #                                                     query = query_embedding
-            #
-            #                                                 )],
-            #                                                 limit = similarity_top_k)
-            # print(scored_points)
-            # return
+                                                      query_filter = filter)
             # Convert to node with score
             return self.convert_score_point_to_node_with_score(scored_points = scored_points) if return_type == "NodeWithScore" else scored_points
 
@@ -563,11 +599,11 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         return result
 
     @staticmethod
-    async def __get_embeddings(texts: list[str],
-                               embedding_model: BaseEmbedding,
-                               batch_size: int,
-                               num_workers: int,
-                               show_progress: bool = True) -> List[Embedding]:
+    async def __get_dense_embeddings(texts: list[str],
+                                     embedding_model: BaseEmbedding,
+                                     batch_size: int,
+                                     num_workers: int,
+                                     show_progress: bool = True) -> List[Embedding]:
         """
         Return embedding from documents
 
@@ -590,6 +626,40 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
         callback_manager = embedding_model.callback_manager
         # Return embedding
         embeddings = await embedding_model.aget_text_embedding_batch(texts=texts, show_progress=show_progress)
+        return embeddings
+
+    @staticmethod
+    def __get_sparse_embeddings(texts: list[str],
+                                embedding_model: SparseTextEmbedding,
+                                batch_size: int,
+                                num_workers: Optional[int] = None,
+                                show_progress: bool = True) -> List[dict]:
+        """
+        Return embedding from documents
+
+        Args:
+            texts (list[str]): List of input text
+            embedding_model (BaseEmbedding): The text embedding model
+            batch_size (int): The desired batch size
+            num_workers (int): The desired num workers
+            show_progress (bool): Indicate show progress or not
+
+        Returns:
+             Return list of Embedding
+        """
+
+        # Set batch size and num workers
+        embedding_model.num_workers = num_workers
+        embedding_model.embed_batch_size = batch_size
+        # Return embedding
+        embeddings = embedding_model.embed(documents = texts,
+                                           batch_size = batch_size,
+                                           parallel = num_workers)
+        # Convert to list of JSON
+        embeddings = [embedding.as_object() for embedding in embeddings]
+        # Normalize list
+        embeddings = [{"values": list(embedding["values"]),
+                       "indices": list(embedding["indices"])} for embedding in embeddings]
         return embeddings
 
     async def reembedding_with_collection(self,
@@ -620,11 +690,11 @@ class AsyncQdrantVectorStore(QdrantVectorStore):
             contents = []
 
         # Get embeddings
-        embeddings = await self.__get_embeddings(texts = contents,
-                                                 embedding_model = embedding_model,
-                                                 batch_size = embedded_batch_size,
-                                                 num_workers = embedded_num_workers,
-                                                 show_progress = show_progress)
+        embeddings = await self.__get_dense_embeddings(texts = contents,
+                                                       embedding_model = embedding_model,
+                                                       batch_size = embedded_batch_size,
+                                                       num_workers = embedded_num_workers,
+                                                       show_progress = show_progress)
         # Get collection name
         if collection_name == None:
             # When not specify
